@@ -144,8 +144,19 @@ def content_type_from_path(path: pathlib.Path) -> Optional[str]:
 
 # -
 
-class FileViewer:
-   content_type: str
+class BodyViewer:
+   content_type: Optional[str] = None
+   def __enter__(self):
+      assert False
+      return None
+
+   def __exit__(self, *etc):
+      assert False
+      return
+
+# -
+
+class FileViewer(BodyViewer):
    path: pathlib.Path
 
    def __init__(self, path):
@@ -165,9 +176,23 @@ class FileViewer:
 
 # -
 
+class MemoryViewer(BodyViewer):
+   view: memoryview
+
+   def __init__(self, view):
+      self.view = view
+
+   def __enter__(self):
+      return self.view
+
+   def __exit__(self, *etc):
+      return
+
+# -
+
 class RequestHeader(NamedTuple):
    method: str
-   uri: str
+   uri: urllib.parse.SplitResult
    http_version: str
    headers: dict[str,str]
 
@@ -176,7 +201,7 @@ class Response(NamedTuple):
    code: int
    reason_phrase: str
    headers: dict[str,str]
-   body: Optional[FileViewer] = None
+   body: Optional[BodyViewer] = None
 
 # -
 
@@ -190,10 +215,8 @@ class NoneManager:
 # -
 
 def GET(req: RequestHeader) -> Response:
-   assert req.uri.startswith('/'), req
-   uri_info = urllib.parse.urlsplit(req.uri)
-   subpath = uri_info.path
-   assert subpath.startswith('/'), uri_info
+   subpath = req.uri.path
+   assert subpath.startswith('/'), req.uri
    subpath = subpath.removeprefix('/')
 
    assert G.SERVE_ROOT
@@ -211,14 +234,95 @@ def GET(req: RequestHeader) -> Response:
 
    return Response(404, 'yeah nah', {})
 
-# -
+# -------------------------------------
+# Nonsense.
+
+HTCPCP_SCHEMES = set([x.lower() for x in [
+   'koffie',      # Afrikaans, Dutch
+   'q\xC3\xA6hv\xC3\xA6',              # Azerbaijani
+   '\xD9\x82\xD9\x87\xD9\x88\xD8\xA9', # Arabic
+   'akeita',      # Basque
+   'koffee',      # Bengali
+   'kahva',       # Bosnian
+   'kafe',        # Bulgarian, Czech
+   'caf\xC3\xE8', # Catalan, French, Galician
+   '\xE5\x92\x96\xE5\x95\xA1',         # Chinese
+   'kava',        # Croatian
+   'k\xC3\xA1va', # Czech
+   'kaffe',       # Danish, Norwegian, Swedish
+   'coffee',      # English
+   'kafo',        # Esperanto
+   'kohv',        # Estonian
+   'kahvi',       # Finnish
+   '%4Baffee',    # German
+   '\xCE\xBA\xCE\xB1\xCF\x86\xCE\xAD', # Greek
+   '\xE0\xA4\x95\xE0\xA5\x8C\xE0\xA4\xAB\xE0\xA5\x80', # Hindi
+   '\xE3\x82\xB3\xE3\x83\xBC\xE3\x83\x92\xE3\x83\xBC', # Japanese
+   '\xEC\xBB\xA4\xED\x94\xBC',         # Korean
+   '\xD0\xBA\xD0\xBE\xD1\x84\xD0\xB5', # Russian
+   '\xE0\xB8\x81\xE0\xB8\xB2\xE0\xB9\x81\xE0\xB8\x9F', # Thai
+]])
+
+COFFEEPOTS: list[str] = [
+   '/',
+]
+TEAPOTS: list[str] = [
+#   '/pot-0/darjeeling',
+#   '/pot-0/earl-grey',
+#   '/pot-1/peppermint',
+]
+
+def htcpcp_request(req: RequestHeader) -> Optional[Response]:
+   # HTCPCP: https://datatracker.ietf.org/doc/html/rfc2324
+   # HTCPCP-TEA: https://datatracker.ietf.org/doc/html/rfc7168
+
+   GERMAN_SCHEME = '%4Baffee'
+   scheme = req.uri.scheme
+   if scheme.lower() == GERMAN_SCHEME.lower() and scheme[0] != GERMAN_SCHEME[0]:
+      # > Note that while URL scheme names are case-independent, capitalization is
+      # > important for German and thus the initial "K" must be encoded.
+      return None
+
+   if req.method in ['BREW','POST']:
+      ct = req.headers.get('Content-Type')
+      if ct in ['message/coffeepot', 'application/coffee-pot-command']:
+         if req.uri.path in COFFEEPOTS:
+            return Response(402, f'https://ko-fi.com/kaylayote', {})
+         if TEAPOTS:
+            return Response(418, 'Tea only!', {})
+         return Response(404, f'No coffeepot at requested URI.', {})
+
+      if ct == 'message/teapot':
+         if req.uri.path in TEAPOTS:
+            return Response(402, f'https://ko-fi.com/kaylayote', {})
+         return Response(404, f'No teapot at requested URI.', {})
+      return Response(501, f'Unrecognized Content-Type: {ct}', {})
+
+   if req.method == 'GET':
+      return Response(204, f'No caffeine may be retrieved electronically.', {})
+
+   if req.method == 'WHEN':
+      return Response(409, f'Server is not currently pouring milk.', {})
+
+   return Response(501, f'Unrecognized method: {req.method}', {})
+
+# End nonsense.
+# -------------------------------------
 
 def response_from_request(req: RequestHeader) -> Response:
+   if req.uri.scheme.lower() in HTCPCP_SCHEMES:
+      if res := htcpcp_request(req):
+         return res
+
+   # -
+
    if req.method == 'POST':
       if 'Content-Length' not in req.headers:
          return Response(400, 'Missing Content-Length.', {})
 
       return Response(404, 'yeah nah', {})
+
+   # -
 
    if req.method in ['GET', 'HEAD']:
       if res := GET(req):
@@ -238,9 +342,10 @@ def handle_client(s: socket.socket, addr: str):
          T.log_prefix = f'[{client_id}]'
 
          # Request-Line = Method SP Request-URI SP HTTP-Version CRLF
-         request_line = cs.recv_line()
+         request_line: str = cs.recv_line()
          log(1, request_line)
-         (method, uri, http_version) = request_line.split(' ')
+         (method, uri_str, http_version) = request_line.split(' ')
+         uri = urllib.parse.urlsplit(uri_str)
 
          headers: dict[str,str] = {}
          while line := cs.recv_line():
