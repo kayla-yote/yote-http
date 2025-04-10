@@ -1,9 +1,11 @@
 #! python3
 
+import base64
 import concurrent.futures
+import hashlib
 import itertools
-import mmap
-import pathlib
+import os
+from pathlib import *
 import random
 import select
 import socket
@@ -13,6 +15,9 @@ import time
 import traceback
 from typing import NamedTuple,Optional,Iterable
 import urllib.parse
+import uuid
+
+from utils import *
 
 
 # -
@@ -22,385 +27,340 @@ import urllib.parse
 # -
 
 ADDRESS = ('', 80)
-SERVER_PRODUCT_INFO = 'yote_http/1.0'
+ENABLE_HTCPCP = True
+SERVER_HEADER_STR = 'yote_http/1.1'
 
 # -
 
-def fuzzy_time(stddev_secs = 60.0) -> str:
-   raw_time = time.time()
-   r = random.normalvariate() * stddev_secs
-   time_t = time.localtime(raw_time + r)
-   s = time.strftime('%Y%b%d-%H:%M:%S', time_t)
-   return s
+class RequestRange(NamedTuple):
+   start: int
+   end: int
+
+   def size(self):
+      return self.end - self.start
+
+   def last(self):
+      return self.end - 1
+
+
+
+def parse_request_range(start_last, byte_size) -> RequestRange:
+   (start,last) = start_last.split('-')
+   start = start.strip()
+   last = last.strip()
+
+   if start == '':
+      if last == '':
+         return RequestRange(0, byte_size)
+
+      return RequestRange(byte_size-int(last), byte_size)
+
+   if last == '':
+      return RequestRange(int(start), byte_size)
+
+   return RequestRange(int(start), int(last)+1)
 
 # -
 
-class Globals:
-   CLIENT_ID_COUNTER = itertools.count(start=1)
-   SERVE_ROOT: Optional[pathlib.Path]
-   INTERNAL_ERROR_COUNTER = itertools.count(start=1)
-
-   def gen_internal_error_id(self) -> str:
-      num = next(self.INTERNAL_ERROR_COUNTER)
-      ts = fuzzy_time()
-      return f'#{num}/{ts}'
+class DigestInfo:
+   path: Path
+   mtime_ns: int = 0
+   digest_by_alg: dict[str,str]
 
 
-class ThreadLocal(threading.local):
-   log_prefix = ''
+DIGEST_INFO_BY_PATH: dict[Path,DigestInfo] = {}
 
 
-G = Globals()
-T = ThreadLocal()
-
-# -
-
-
-VERBOSE = 10
-def log(v,*args):
-   if VERBOSE < v:
-      return
-   if T.log_prefix:
-      print(T.log_prefix, *args)
-   else:
-      print(*args)
-
-# -
-
-HTTP_EOL = b'\r\n'
-
-class ClientSocket:
-   RECV_SIZE = 1024
-
-   def __init__(self, conn: socket.socket, addr: str):
-      self.conn = conn
-      self.addr = addr
-      self.recv_buffer = b''
-      self.pos = 0
-
-
-   def send_line(self, line: str):
-      b = line.encode() + HTTP_EOL
-      log(2, f'< {b!r}')
-      self.conn.sendall(b)
-
-
-   def send_bytes(self, mv: memoryview):
-      log(2, f'< [{len(mv)} bytes]')
-      self.conn.sendall(mv)
-
-
-   def recv_split(self, delim: bytes) -> tuple[bytes,bytes]:
-      pos = 0
-      while True:
-         # Ensure we catch e.g. '\r\n' if we recv '\r' and then '\n' split from eachother.
-         pos = max(0, pos-len(delim)-1)
-         try:
-            delim_pos = self.recv_buffer.index(delim, pos)
-         except ValueError:
-            more = self.conn.recv(self.RECV_SIZE)
-            if not more:
-               delim_pos = len(self.recv_buffer)
-               delim = b''
-               break
-            log(2, f'> {more!r}')
-            self.recv_buffer += more
-            continue
-         break
-      ret = self.recv_buffer[:delim_pos]
-      self.recv_buffer = self.recv_buffer[len(ret)+len(delim):]
-      return (ret, delim)
-
-
-   def recv_line(self) -> str:
-      (b,_) = self.recv_split(HTTP_EOL)
-      s = b.decode()
-      return s
-
-# -
-
-# https://www.iana.org/assignments/media-types/media-types.xhtml
-MIME_TYPE_BY_SUFFIX: dict[str,str] = {
-   '.css': 'text/css',
-   '.csv': 'text/csv',
-   '.html': 'text/html',
-   '.js': 'text/javascript',
-   '.md': 'text/markdown',
-   '.txt': 'text/plain',
-   '.wgsl': 'text/wgsl',
-   '.xml': 'text/xml',
+DIGESTERS_BY_ALG = {
+   'sha': hashlib.sha1,
+   'sha-256': hashlib.sha256,
+   'sha-512': hashlib.sha512,
 }
-INFER_MIME_TYPES = True
-if not INFER_MIME_TYPES:
-   MIME_TYPE_BY_SUFFIX = {}
+
+def repr_digest_file(path: Path, alg: str) -> str:
+   digester = DIGESTERS_BY_ALG[alg]()
+
+   data = path.read_bytes()
+   digester.update(data)
+   b = digester.digest()
+
+   b64_str = base64.b64encode(b).decode()
+   # Repr-Digest: sha-256=:AEGPTgUMw5e96wxZuDtpfm23RBU3nFwtgY5fw4NYORo=:
+   return f'{alg}=:{b64_str}:'
 
 
-def content_type_from_path(path: pathlib.Path) -> Optional[str]:
+def cached_repr_digest_file(path: Path, alg: str, stats: os.stat_result) -> str:
    try:
-      return MIME_TYPE_BY_SUFFIX[path.suffix]
+      di = DIGEST_INFO_BY_PATH[path]
    except KeyError:
-      pass
-   return None
+      di = DigestInfo()
+      di.path = path
 
-# -
+   if stats.st_mtime_ns != di.mtime_ns:
+      di.mtime_ns = stats.st_mtime_ns
+      di.digest_by_alg = {}
 
-class BodyViewer:
-   content_type: Optional[str] = None
-   def __enter__(self):
-      assert False
-      return None
+   if alg not in di.digest_by_alg:
+      di.digest_by_alg[alg] = repr_digest_file(path, alg)
 
-   def __exit__(self, *etc):
-      assert False
-      return
-
-# -
-
-class FileViewer(BodyViewer):
-   path: pathlib.Path
-
-   def __init__(self, path):
-      self.content_type = content_type_from_path(path)
-      self.path = path
-
-   def __enter__(self):
-      self.f = self.path.open('rb')
-      self.mm = mmap.mmap(self.f.fileno(), 0, access=mmap.ACCESS_READ)
-      return self.mm
-
-   def __exit__(self, *etc):
-      self.mm.close()
-      self.mm = None
-      self.f.close()
-      self.f = None
-
-# -
-
-class MemoryViewer(BodyViewer):
-   view: memoryview
-
-   def __init__(self, view):
-      self.view = view
-
-   def __enter__(self):
-      return self.view
-
-   def __exit__(self, *etc):
-      return
-
-# -
-
-class RequestHeader(NamedTuple):
-   method: str
-   uri: urllib.parse.SplitResult
-   http_version: str
-   headers: dict[str,str]
+   DIGEST_INFO_BY_PATH[path] = di
+   return di.digest_by_alg[alg]
 
 
-class Response(NamedTuple):
-   code: int
-   reason_phrase: str
-   headers: dict[str,str]
-   body: Optional[BodyViewer] = None
+def parse_cskev(s: str):
+   # e.g. s='sha-512=8, sha-256=6, adler=0, sha=1'
+   for kev in [x.strip() for x in s.split(',')]:
+      k_v = [x.strip() for x in kev.split('=', 1)]
+      try:
+         (k, v) = k_v
+      except ValueError:
+         (k, v) = k_v + ['']
+      yield
 
-# -
 
-class NoneManager:
-   def __enter__(self):
-      return None
-
-   def __exit__(self, *etc):
-      return
-
-# -
-
-def GET(req: RequestHeader) -> Response:
-   subpath = req.uri.path
-   assert subpath.startswith('/'), req.uri
-   subpath = subpath.removeprefix('/')
-
-   assert G.SERVE_ROOT
+def GET(req: RequestHeader) -> Optional[Response]:
+   subpath = pop_prefix(req.uri.path, '/')
    path = G.SERVE_ROOT / subpath
 
+   hardpath = path.resolve()
+
+   for jail in G.GET_JAILS:
+      hardjail = jail.resolve()
+      try:
+          hardpath.relative_to(hardjail)
+          break
+      except ValueError:
+         continue
+   else:
+      return Response(403, 'Will neither confirm nor deny that path exists.')
+
    if path.is_dir():
-      index = path / 'index.html'
-      if index.exists():
-         body = FileViewer(index)
-         return Response(200, 'kay', {}, body)
+      path = path / 'index.html'
 
-   if path.is_file():
-      body = FileViewer(path)
-      return Response(200, 'kay', {}, body)
+   try:
+      f = path.open('rb')
+   except FileNotFoundError:
+      return Response(404, 'yeah nah')
 
-   return Response(404, 'yeah nah', {})
+   with f:
+      stats = path.stat()
+      mtime = stats.st_mtime
+      mtime_ns = stats.st_mtime_ns
 
-# -------------------------------------
-# Nonsense.
+      f.seek(0, os.SEEK_END)
+      byte_size = f.tell()
+      f.seek(0, os.SEEK_SET)
 
-ENABLE_HTCPCP = True
-IMPLY_HTCPCP_FROM_CONTENT_TYPE = True
-IMPLY_HTCPCP_FROM_METHOD_BREW = True
+      content_type = content_type_from_path(path)
 
-HTCPCP_SCHEMES = set([x.lower() for x in [
-   'koffie',      # Afrikaans, Dutch
-   'q\xC3\xA6hv\xC3\xA6',              # Azerbaijani
-   '\xD9\x82\xD9\x87\xD9\x88\xD8\xA9', # Arabic
-   'akeita',      # Basque
-   'koffee',      # Bengali
-   'kahva',       # Bosnian
-   'kafe',        # Bulgarian, Czech
-   'caf\xC3\xE8', # Catalan, French, Galician
-   '\xE5\x92\x96\xE5\x95\xA1',         # Chinese
-   'kava',        # Croatian
-   'k\xC3\xA1va', # Czech  <- My errata! -Kayla
-   'kaffe',       # Danish, Norwegian, Swedish
-   'coffee',      # English
-   'kafo',        # Esperanto
-   'kohv',        # Estonian
-   'kahvi',       # Finnish
-   '%4Baffee',    # German
-   '\xCE\xBA\xCE\xB1\xCF\x86\xCE\xAD', # Greek
-   '\xE0\xA4\x95\xE0\xA5\x8C\xE0\xA4\xAB\xE0\xA5\x80', # Hindi
-   '\xE3\x82\xB3\xE3\x83\xBC\xE3\x83\x92\xE3\x83\xBC', # Japanese
-   '\xEC\xBB\xA4\xED\x94\xBC',         # Korean
-   '\xD0\xBA\xD0\xBE\xD1\x84\xD0\xB5', # Russian
-   '\xE0\xB8\x81\xE0\xB8\xB2\xE0\xB9\x81\xE0\xB8\x9F', # Thai
-]])
-def is_scheme_htcpcp(scheme: str) -> bool:
-   assert not scheme.endswith(':'), scheme
-   if scheme.lower() not in HTCPCP_SCHEMES:
-      return False
+      res = Response(200, 'kay~')
+      get_range_header = None
+      is_range_get = req.method == 'GET' and 'Range' in req.headers
+      if is_range_get:
+         get_range_header = req.headers['Range']
+         get_range_header = only_without_prefix(get_range_header, 'bytes=')
+      if get_range_header:
+         res = Response(206, 'k~')
 
-   GERMAN_SCHEME = '%4Baffee'
-   if scheme.lower() == GERMAN_SCHEME.lower() and scheme[0] != GERMAN_SCHEME[0]:
-      # > Note that while URL scheme names are case-independent, capitalization is
-      # > important for German and thus the initial "K" must be encoded.
-      return False
+      ranges_str = get_range_header or '0-'
+      ranges = [parse_request_range(s.strip(), byte_size) for s in ranges_str.split(',')]
 
-   return True
+      def coalesce_ranges(ranges: list[RequestRange]) -> list[RequestRange]:
+         ranges = sorted(ranges, key=lambda x: x.start)
+         ret = [ ranges[0] ]
+         for r in ranges[1:]:
+            prev = ret[-1]
+            if r.start <= prev.end:
+               ret[-1] = RequestRange(prev.start, max(prev.end, r.end))
+            else:
+               ret += [r]
+         return ret
+
+      ranges = coalesce_ranges(ranges)
+
+      # -
+
+      def content_range_string(rr: RequestRange):
+         return f'bytes {rr.start}-{rr.last()}/{byte_size}'
+      def content_range_length(start, count):
+         return count
 
 
+      def send_range_body(rr: RequestRange):
+         req.cs.send_file(f, rr.start, rr.size())
 
-HTCPCP_CONTENT_TYPES_COFFEE = set(['message/coffeepot', 'application/coffee-pot-command'])
-HTCPCP_CONTENT_TYPES_TEA = set(['message/teapot'])
-HTCPCP_CONTENT_TYPES = HTCPCP_CONTENT_TYPES_COFFEE | HTCPCP_CONTENT_TYPES_TEA
-def is_request_htcpcp(req: RequestHeader) -> bool:
-   scheme = req.uri.scheme
-   if scheme:
-      return is_scheme_htcpcp(scheme)
+      def http_time(t: float):
+         #  rfc1123-date = wkday "," SP date1 SP time SP "GMT"
+         #  wkday        = "Mon" | "Tue" | "Wed"
+         #               | "Thu" | "Fri" | "Sat" | "Sun"
+         #  date1        = 2DIGIT SP month SP 4DIGIT
+         #                 ; day month year (e.g., 02 Jun 1982)
+         #  time         = 2DIGIT ":" 2DIGIT ":" 2DIGIT
+         #                 ; 00:00:00 - 23:59:59
+         st = time.gmtime(t)
+         wkday = 'Mon Tue Wed Thu Fri Sat Sun'.split(' ')[st.tm_wday]
+         month = 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split(' ')[st.tm_mon-1]
+         date1f = f'%d {month} %Y'
+         timef = f'%H:%M:%S'
+         return time.strftime(f'{wkday}, {date1f} {timef} GMT', st)
 
-   if IMPLY_HTCPCP_FROM_METHOD_BREW:
-      if req.method == 'BREW':
-         return True
-   if IMPLY_HTCPCP_FROM_CONTENT_TYPE:
-      ct = req.headers.get('Content-Type')
-      if ct in HTCPCP_CONTENT_TYPES:
-         return True
+      res.headers['Date'] = http_time(time.time())
+      res.headers['Last-modified'] = http_time(mtime)
 
-   return False
+      # -
 
+      if wrd := req.headers.get('Want-Repr-Digest'):
+         k_v_list = [kev.strip().split('=', 1) for kev in wrd.split(',')]
+         k_v_list = sorted(k_v_list, key=lambda x: -int(x[1])) # Highest preference first
+         for (alg, preference_str) in k_v_list:
+            preference_val = int(preference_str)
+            if preference_val <= 0:
+               continue
+            if alg not in DIGESTERS_BY_ALG:
+               print(f'Warning: Want-Repr-Digest alg "{alg}" not recognized.')
+               continue
+            rd = cached_repr_digest_file(path, alg, stats)
+            res.headers['Repr-Digest'] = rd
 
-CONTENT_TYPE_BY_POT_PATH: dict[str,str] = {
-   #'/': 'message/coffeepot',
-   #'/tea': 'message/teapot',
-   '/kofi': 'message/coffeepot',
-}
+      # -
 
-def htcpcp_request(req: RequestHeader) -> Optional[Response]:
-   # HTCPCP: https://datatracker.ietf.org/doc/html/rfc2324
-   # HTCPCP-TEA: https://datatracker.ietf.org/doc/html/rfc7168
+      if len(ranges) == 1:
+         # >Content-Range: bytes 21010-47021/47022
+         # >Content-Length: 26012
+         rr = ranges[0]
+         res.headers['Content-type'] = content_type
+         res.headers['Content-length'] = f'{rr.size()}'
 
-   if req.method in ['BREW','POST']:
-      header_ct = req.headers.get('Content-Type')
-      if header_ct and header_ct not in HTCPCP_CONTENT_TYPES:
-         return Response(501, f'Unrecognized Content-Type "{header_ct}" not in {HTCPCP_CONTENT_TYPES}.', {})
+         if get_range_header:
+            res.headers['Content-range'] = content_range_string(rr)
+         send_response_header(req.cs, res)
+         if req.method == 'GET':
+            send_range_body(rr)
+         return None
 
-      pot_ct = CONTENT_TYPE_BY_POT_PATH.get(req.uri.path, None)
-      if header_ct != pot_ct:
-         if header_ct != 'message/teapot':
-            return Response(418, "I'm a teapot", {})
-         else:
-            return Response(418, "I'm NOT a teapot", {})
+      # multipart/byteranges:
+      '''
+      HTTP/1.1 206 Partial content
+      Date: Wed, 15 Nov 1995 06:25:24 GMT
+      Last-modified: Wed, 15 Nov 1995 04:58:08 GMT
+      Content-type: multipart/byteranges; boundary=THIS_STRING_SEPARATES
 
-      return Response(402, f'https://ko-fi.com/kaylayote', {})
+      --THIS_STRING_SEPARATES
+      Content-type: application/pdf
+      Content-range: bytes 500-999/8000
 
+      ...the first range...
+      --THIS_STRING_SEPARATES
+      Content-type: application/pdf
+      Content-range: bytes 7000-7999/8000
 
-   if req.method == 'GET':
-      return Response(204, f'No caffeine may be retrieved electronically.', {})
+      ...the second range
+      --THIS_STRING_SEPARATES--
+      '''
+      boundary = uuid.uuid4() # Unguessable, won't collide with body.
+      boundary_str = str(boundary)
 
-   if req.method == 'WHEN':
-      return Response(409, f'Server is not currently pouring milk.', {})
+      res.headers['Content-type'] = f'multipart/byteranges; boundary={boundary_str}'
+      send_response_header(req.cs, res)
 
-   return Response(501, f'Unrecognized method: {req.method}', {})
+      part_headers = {}
+      part_headers['Content-type'] = content_type
+      for rr in ranges:
+         part_headers['Content-range'] = content_range_string(rr)
 
-# End nonsense.
-# -------------------------------------
+         req.cs.send_line(f'--{boundary_str}')
+         send_header_lines(req.cs, part_headers)
+         send_range_body(rr)
 
-def response_from_request(req: RequestHeader) -> Response:
-   if ENABLE_HTCPCP and is_request_htcpcp(req):
-      if res := htcpcp_request(req):
-         return res
+      req.cs.send_line(f'--{boundary_str}--')
+      return None
+
+# -
+
+import mod_htcpcp
+
+def response_from_request(req: RequestHeader) -> Optional[Response]:
+   if ENABLE_HTCPCP:
+      if ret := mod_htcpcp.respond_htcpcp(req):
+         return ret
 
    # -
 
    if req.method == 'POST':
       if 'Content-Length' not in req.headers:
-         return Response(400, 'Missing Content-Length.', {})
+         return Response(400, 'Missing Content-Length.')
 
-      return Response(404, 'yeah nah', {})
+      return Response(403, 'yeah nah')
 
    # -
 
    if req.method in ['GET', 'HEAD']:
-      if res := GET(req):
-         return res
-      return Response(404, 'yeah nah', {})
+      return GET(req)
 
-   return Response(501, f'Unrecognized method: {req.method}', {})
+   return Response(501, f'Unrecognized method: {req.method}')
 
 # -
+
+def send_response_header(cs: HttpSocket, res: Response):
+   res.headers['Server'] = SERVER_HEADER_STR
+
+   cs.send_line(f'{SERVER_HTTP_VERSION} {res.code} {res.reason_phrase}')
+   for k,v in res.headers.items():
+      cs.send_line(f'{k}: {v}')
+   cs.send_line('')
+
 
 def handle_client(s: socket.socket, addr: str):
    with s:
       try:
-         cs = ClientSocket(s, addr)
+         cs = HttpSocket(s, addr)
 
          client_id = next(G.CLIENT_ID_COUNTER)
          T.log_prefix = f'[{client_id}]'
 
-         # Request-Line = Method SP Request-URI SP HTTP-Version CRLF
-         request_line: str = cs.recv_line()
-         log(1, request_line)
-         (method, uri_str, http_version) = request_line.split(' ')
-         uri = urllib.parse.urlsplit(uri_str)
+         while True:
+            # Request-Line = Method SP Request-URI SP HTTP-Version CRLF
+            request_line = cs.recv_line()
+            if request_line == None:
+               break
+            log(1, request_line)
+            (method, uri_str, http_version_str) = request_line.split(' ')
+            uri = urllib.parse.urlsplit(uri_str)
+            http_version_str = pop_prefix(http_version_str, 'HTTP/')
+            http_version = [int(x) for x in http_version_str.split('.')]
 
-         headers: dict[str,str] = {}
-         while line := cs.recv_line():
-            (k,v) = line.split(':', 1)
-            headers[k.strip()] = v.strip()
+            headers: dict[str,str] = {}
+            while line := cs.recv_line():
+               (k,v) = line.split(':', 1)
+               headers[k.strip()] = v.strip()
 
-         req = RequestHeader(method, uri, http_version, headers)
-         res = response_from_request(req)
+            req = RequestHeader(cs, method, uri, http_version, headers)
 
-         with res.body or NoneManager() as data:
-            res.headers['Server'] = SERVER_PRODUCT_INFO
-            if data:
-               assert res.body
-               content_type = res.body.content_type
-               if content_type:
-                  res.headers['Content-Type'] = content_type
-               res.headers['Content-Length'] = str(len(data))
+            if req.http_version >= [1,1]:
+               AIZUCHI = [
+                  'はい',
+                  'ええ',
+                  'うん',
+                  'そう',
+                  'そうですか',
+                  'そっか',
+                  'へえ',
+                  '本当に',
+               ]
+               continue_res = Response(100, random.choice(AIZUCHI)+'~')
+               send_response_header(cs, continue_res)
 
-            cs.send_line(f'HTTP/1.0 {res.code} {res.reason_phrase}')
-            for k,v in res.headers.items():
-               cs.send_line(f'{k}: {v}')
-            cs.send_line('')
+            res = response_from_request(req)
 
-            if data and req.method != 'HEAD':
-               cs.send_bytes(data)
-         return
+            if res:
+               send_response_header(cs, res)
+
+            continue
       except ConnectionAbortedError:
          log(2, 'ConnectionAbortedError')
+         pass
+      except ExHttpSocketDisconnected:
+         log(1, 'Client disconnected.')
          pass
       except:
          try:
@@ -414,7 +374,7 @@ def handle_client(s: socket.socket, addr: str):
             ]
             log(0, '\n'.join(lines))
 
-            cs.send_line(f'HTTP/1.0 500 uwu')
+            cs.send_line(f'HTTP/1.0 500 ><')
             cs.send_line('')
          except:
             traceback.print_exc()
@@ -443,15 +403,16 @@ if __name__ == '__main__':
    G.SERVE_ROOT = pathlib.Path(serve_root)
    assert G.SERVE_ROOT.is_dir(), G.SERVE_ROOT
 
-   # -
+   G.GET_JAILS = [G.SERVE_ROOT]
 
-   REQUEST_POOL = concurrent.futures.ThreadPoolExecutor(thread_name_prefix='client')
+   # -
 
    def thread__accept() -> None:
       s_list: list[socket.socket] = []
       def create_server(*args, **kwargs):
          try:
             s = socket.create_server(*args, **kwargs)
+            print(*args)
             s_list.append(s)
          except:
             traceback.print_exc()
@@ -461,8 +422,9 @@ if __name__ == '__main__':
       while True:
          (ready,_,_) = select.select(s_list,[],[])
          for s in ready:
-            (client_s, client_addr) = s.accept()
-            REQUEST_POOL.submit(handle_client, client_s, client_addr)
+            (client_s, client_addr) = args = s.accept()
+
+            threading.Thread(target=handle_client, args=(client_s, client_addr), name='handle_client', daemon=True).start()
 
    threading.Thread(target=thread__accept, name='thread__accept', daemon=True).start()
 
